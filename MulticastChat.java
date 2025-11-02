@@ -10,20 +10,14 @@ import java.util.concurrent.*;
  * MulticastChat
  * ---------------------------------------------------------
  * Programa que demuestra el uso de MULTICAST y CONCURRENCIA
- * en sistemas distribuidos, según el plan docente UTPL 2025–2026.
+ * en sistemas distribuidos (Ubuntu/Windows, solo CLI).
  *
- * Funcionalidades:
- *  - Envío y recepción de mensajes multicast.
- *  - Concurrencia mediante ExecutorService (pool de hilos).
- *  - Selección de interfaz de red (útil en Proxmox, ZeroTier o Hamachi).
- *  - Cierre seguro con hook de apagado.
- *
- * Autor: (Nombre del estudiante)
- * Docente: Rommel Vicente Torres Tandazo, PhD
- * Asignatura: Sistemas Distribuidos
- * ---------------------------------------------------------
+ * Cambios clave:
+ *  - Lector de consola bloqueante en hilo dedicado (Windows-friendly).
+ *  - Hilo sender para /auto y envíos.
+ *  - Loopback multicast habilitado (Windows).
+ *  - Eco local al enviar.
  */
-
 public class MulticastChat {
 
     private static final int MAX_PACKET = 8192;
@@ -39,7 +33,6 @@ public class MulticastChat {
             r -> {
                 Thread t = new Thread(r);
                 t.setDaemon(true);
-                // ✅ Reemplazo de método obsoleto getId()
                 t.setName("worker-" + System.identityHashCode(t));
                 return t;
             });
@@ -56,7 +49,10 @@ public class MulticastChat {
     public void start() throws IOException {
         MulticastSocket socket = new MulticastSocket(port);
         socket.setReuseAddress(true);
-        socket.setTimeToLive(16); // TTL: 1 local, 16 LAN
+        socket.setTimeToLive(16); // 1=local, 16=LAN/lab
+
+        // IMPORTANTE para Windows: false = loopback habilitado (sí, el nombre es confuso)
+        socket.setLoopbackMode(false);
 
         if (netIf != null) socket.setNetworkInterface(netIf);
         socket.joinGroup(new InetSocketAddress(group, port), netIf);
@@ -65,11 +61,73 @@ public class MulticastChat {
                 nodeName, group.getHostAddress(), port,
                 netIf != null ? netIf.getDisplayName() : "<default>");
 
+        // Receptor en hilo dedicado
         Thread receiver = new Thread(() -> receiveLoop(socket));
         receiver.setDaemon(true);
         receiver.setName("receiver");
         receiver.start();
 
+        // ---- Entrada y envío (compatible Windows) ----
+        final BlockingQueue<String> outbound = new LinkedBlockingQueue<>();
+
+        // Hilo lector de consola: bloquea en nextLine() y coloca en cola
+        Thread consoleReader = new Thread(() -> {
+            try (Scanner sc = new Scanner(System.in)) {
+                while (running) {
+                    String line;
+                    try {
+                        line = sc.nextLine(); // bloqueante hasta Enter
+                    } catch (Exception e) {
+                        break; // consola cerrada
+                    }
+                    if (line == null) break;
+                    outbound.offer(line.trim());
+                }
+            }
+        });
+        consoleReader.setDaemon(true);
+        consoleReader.setName("console-reader");
+        consoleReader.start();
+
+        // Hilo sender: maneja /auto y vacía la cola outbound
+        Thread sender = new Thread(() -> {
+            boolean auto = false;
+            long lastAuto = 0L;
+            while (running) {
+                try {
+                    long now = System.currentTimeMillis();
+                    if (auto && now - lastAuto >= 2000) {
+                        String hb = String.format("heartbeat from %s @ %s", nodeName, TS.format(LocalDateTime.now()));
+                        send(socket, hb);
+                        System.out.println("(enviado) " + hb); // eco local
+                        lastAuto = now;
+                    }
+
+                    String line = outbound.poll(200, TimeUnit.MILLISECONDS);
+                    if (line != null) {
+                        if (line.equalsIgnoreCase("/quit")) { running = false; break; }
+                        if (line.equalsIgnoreCase("/auto")) {
+                            auto = !auto;
+                            System.out.println("[INFO] Auto=" + auto);
+                            continue;
+                        }
+                        if (!line.isEmpty()) {
+                            send(socket, line);
+                            System.out.println("(enviado) " + line); // eco local
+                        }
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+        sender.setDaemon(true);
+        sender.setName("sender");
+        sender.start();
+        // ----------------------------------------------
+
+        // Hook de cierre
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             running = false;
             try {
@@ -80,43 +138,12 @@ public class MulticastChat {
             System.out.println("\n[INFO] Finalizado correctamente.");
         }));
 
-        try (Scanner sc = new Scanner(System.in)) {
-            System.out.println("[INFO] Escriba mensajes y presione Enter. Use /auto para latidos, /quit para salir.");
-            boolean auto = false;
-            long lastAuto = 0L;
-
-            while (running) {
-                if (auto) {
-                    long now = System.currentTimeMillis();
-                    if (now - lastAuto >= 2000) {
-                        String msg = String.format("heartbeat from %s @ %s", nodeName, TS.format(LocalDateTime.now()));
-                        send(socket, msg);
-                        lastAuto = now;
-                    }
-                }
-
-                try {
-                    if (System.in.available() > 0) {
-                        String line = sc.nextLine().trim();
-                        if (line.equalsIgnoreCase("/quit")) break;
-                        if (line.equalsIgnoreCase("/auto")) {
-                            auto = !auto;
-                            System.out.println("[INFO] Modo automático: " + auto);
-                            continue;
-                        }
-                        if (!line.isEmpty()) send(socket, line);
-                    } else {
-                        Thread.sleep(50);
-                    }
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        } // 👈 cierre correcto del bloque try-with-resources
-
+        // Mantener vivo hasta /quit o Ctrl+C
+        while (running) {
+            try { Thread.sleep(200); } catch (InterruptedException e) { break; }
+        }
         System.exit(0);
-    } // 👈 cierre correcto del método start()
+    }
 
     private void receiveLoop(MulticastSocket socket) {
         byte[] buf = new byte[MAX_PACKET];
@@ -160,7 +187,7 @@ public class MulticastChat {
     private static void usage() {
         System.out.println("Uso:");
         System.out.println("  java MulticastChat --group 239.1.1.1 --port 5000 --iface <IP> --name \"Nodo-X\"");
-        System.out.println("Comandos durante ejecución: /auto (modo latido), /quit (salir)");
+        System.out.println("Comandos: /auto (latidos cada 2s), /quit (salir)");
     }
 
     public static void main(String[] args) throws Exception {
